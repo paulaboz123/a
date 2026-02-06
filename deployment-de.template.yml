@@ -1,0 +1,21 @@
+$schema: https://azuremlschemas.azureedge.net/latest/batchDeployment.schema.json
+name: __DEPLOYMENT_NAME__
+endpoint_name: __ENDPOINT_NAME__
+type: model
+
+# Replace with your real model asset
+model: __MODEL_ASSET__
+
+code_configuration:
+  code: __CODE_DIR__
+  scoring_script: score.py
+
+# Replace with your real env (this is just a placeholder env asset)
+environment: azureml:aml-v2@latest
+
+resources:
+  instance_count: 1
+
+mini_batch_size: "10"
+max_concurrency_per_instance: 2
+output_action: append_row
