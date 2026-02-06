@@ -1,19 +1,24 @@
 $schema: https://azuremlschemas.azureedge.net/latest/batchDeployment.schema.json
 name: de-model
-endpoint_name: albot-batch-endpoint-dev
-type: model
+endpoint_name: albot-endpoint-dev
 
 model: azureml:de@latest
+environment: azureml:aml-v2@latest
 
 code_configuration:
-  code: "../../../../training"
-  scoring_script: "score.py"
+  code: ../../../training
+  scoring_script: score.py
 
-environment: azureml:albot-aml-v2@latest
+# KLUCZOWA RÓŻNICA VS ONLINE:
+compute: azureml:cpu-cluster
 
+# (opcjonalnie, ale typowe w batch)
 resources:
   instance_count: 1
 
-mini_batch_size: "1"
-max_concurrency_per_instance: 1
-output_action: append_row
+# (opcjonalne ustawienia batch)
+settings:
+  mini_batch_size: 1
+  output_action: append_row
+  output_file_name: predictions.csv
+  max_concurrency_per_instance: 1
