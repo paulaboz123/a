@@ -1,0 +1,149 @@
+# azure-pipelines/batch-endpoint.yml
+# Deploys Azure ML Batch Endpoint + 3 Batch Deployments from deployment/<ENV>/endpoint.yml + model-*.yml
+# Optionally runs a smoke-test invoke (creates a Batch Job) when runSmokeTest=true.
+
+parameters:
+  - name: environment
+    type: string
+    values: [DEV, TEST, PROD]
+
+  - name: serviceConnection
+    type: string
+
+  - name: resourceGroup
+    type: string
+
+  - name: amlWorkspace
+    type: string
+
+  # Smoke test controls (optional)
+  - name: runSmokeTest
+    type: boolean
+    default: false
+
+  # For smoke test invoke only (azureml:// URI folder/file)
+  - name: inputPath
+    type: string
+    default: ""
+
+  - name: outputPath
+    type: string
+    default: ""
+
+  # Which deployment to use for smoke test (e.g. de-model / pl-model / en-model)
+  - name: deploymentName
+    type: string
+    default: ""
+
+steps:
+  - checkout: self
+
+  - task: Bash@3
+    displayName: Install tools (yq + az ml extension)
+    inputs:
+      targetType: inline
+      script: |
+        set -euo pipefail
+
+        if ! command -v yq >/dev/null 2>&1; then
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.2/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+        fi
+
+        az extension add -n ml -y || az extension update -n ml
+
+  - task: AzureCLI@2
+    name: deploy_batch
+    displayName: Deploy Azure ML Batch Endpoint + Deployments
+    inputs:
+      azureSubscription: ${{ parameters.serviceConnection }}
+      scriptType: bash
+      scriptLocation: inlineScript
+      failOnStandardError: false
+      workingDirectory: deployment/${{ parameters.environment }}
+      inlineScript: |
+        set -euo pipefail
+        az configure --defaults group=${{ parameters.resourceGroup }} workspace=${{ parameters.amlWorkspace }}
+
+        ENDPOINT_FILE="endpoint.yml"
+        [ -f "$ENDPOINT_FILE" ] || (echo "ERROR: Missing $ENDPOINT_FILE in $(pwd)" && exit 1)
+
+        ENDPOINT_NAME="$(yq -r '.name' "$ENDPOINT_FILE")"
+        [ -n "$ENDPOINT_NAME" ] && [ "$ENDPOINT_NAME" != "null" ] || (echo "ERROR: endpoint.yml must contain .name" && exit 1)
+
+        echo "Batch endpoint: $ENDPOINT_NAME"
+
+        # Create/Update endpoint
+        if az ml batch-endpoint show -n "$ENDPOINT_NAME" >/dev/null 2>&1; then
+          echo "Updating batch endpoint..."
+          az ml batch-endpoint update -f "$ENDPOINT_FILE"
+        else
+          echo "Creating batch endpoint..."
+          az ml batch-endpoint create -f "$ENDPOINT_FILE"
+        fi
+
+        # Create/Update deployments (model-*.yml)
+        shopt -s nullglob
+        DEPLOYMENT_FILES=(model-*.yml)
+        [ ${#DEPLOYMENT_FILES[@]} -gt 0 ] || (echo "ERROR: No model-*.yml files in $(pwd)" && exit 1)
+
+        for f in "${DEPLOYMENT_FILES[@]}"; do
+          DEPLOYMENT_NAME="$(yq -r '.name' "$f")"
+          DEPLOYMENT_ENDPOINT="$(yq -r '.endpoint_name' "$f")"
+
+          [ -n "$DEPLOYMENT_NAME" ] && [ "$DEPLOYMENT_NAME" != "null" ] || (echo "ERROR: $f must contain .name" && exit 1)
+          [ -n "$DEPLOYMENT_ENDPOINT" ] && [ "$DEPLOYMENT_ENDPOINT" != "null" ] || (echo "ERROR: $f must contain .endpoint_name" && exit 1)
+          [ "$DEPLOYMENT_ENDPOINT" = "$ENDPOINT_NAME" ] || (echo "ERROR: $f endpoint_name mismatch ($DEPLOYMENT_ENDPOINT != $ENDPOINT_NAME)" && exit 1)
+
+          echo "Deploying batch deployment: $DEPLOYMENT_NAME"
+
+          if az ml batch-deployment show -e "$ENDPOINT_NAME" -n "$DEPLOYMENT_NAME" >/dev/null 2>&1; then
+            echo "Updating deployment..."
+            az ml batch-deployment update -f "$f"
+          else
+            echo "Creating deployment..."
+            az ml batch-deployment create -f "$f"
+          fi
+        done
+
+  - task: AzureCLI@2
+    name: smoke_test_invoke
+    displayName: Smoke test (batch invoke -> job)
+    condition: and(succeeded(), eq(${{ parameters.runSmokeTest }}, true))
+    inputs:
+      azureSubscription: ${{ parameters.serviceConnection }}
+      scriptType: bash
+      scriptLocation: inlineScript
+      failOnStandardError: false
+      workingDirectory: deployment/${{ parameters.environment }}
+      inlineScript: |
+        set -euo pipefail
+        az configure --defaults group=${{ parameters.resourceGroup }} workspace=${{ parameters.amlWorkspace }}
+
+        ENDPOINT_NAME="$(yq -r '.name' endpoint.yml)"
+
+        if [ -z "${{ parameters.inputPath }}" ] || [ -z "${{ parameters.outputPath }}" ] || [ -z "${{ parameters.deploymentName }}" ]; then
+          echo "ERROR: runSmokeTest=true requires inputPath, outputPath, deploymentName"
+          exit 1
+        fi
+
+        echo "Invoking batch endpoint..."
+        echo "  endpoint:    $ENDPOINT_NAME"
+        echo "  deployment:  ${{ parameters.deploymentName }}"
+        echo "  input:       ${{ parameters.inputPath }}"
+        echo "  output:      ${{ parameters.outputPath }}"
+
+        JOB_NAME="$(az ml batch-endpoint invoke \
+          -n "$ENDPOINT_NAME" \
+          --deployment-name "${{ parameters.deploymentName }}" \
+          --input "${{ parameters.inputPath }}" \
+          --output "${{ parameters.outputPath }}" \
+          --query name -o tsv)"
+
+        echo "Created job: $JOB_NAME"
+
+        echo "Waiting for job completion..."
+        az ml job wait -n "$JOB_NAME" --status Completed --timeout 7200
+
+        echo "Job status:"
+        az ml job show -n "$JOB_NAME" --query status -o tsv
