@@ -1,25 +1,23 @@
-# score.py for Azure ML Batch endpoints
-# - Keeps your input contract: JSON with keys: "document" and "num_preds"
-# - Batch run() receives a list of file paths (mini-batch). Each file should contain JSON text
-#   matching the same contract you used for online.
-#
-# Recommended input format for batch:
-# - A folder (URI) containing *.json files, each one a single JSON request payload
-#   OR a single .json file if you set mini_batch_size=1.
-#
-# Output:
-# - For each input file, returns one dict. AML batch will materialize output as a file (depending on deployment settings).
-#
-import json
+# score.py (Batch Endpoint) — minimal changes vs Online
+# Zmienione tylko to, co musi być zmienione:
+# - run() ma teraz signature run(mini_batch) i czyta JSON z plików
+# - dodana obsługa błędów per plik (nie wywala całego joba na 1 złym wejściu)
+# Pozostałe funkcje zostają w tej samej logice co online.
+
 import os
+import json
+import time
 import logging
-import traceback
-from typing import Any, Dict, List, Union
+
+import pandas as pd
+
+# zakładam, że te importy masz w projekcie tak jak wcześniej
+import pre_processing
+from models import LogisticRegression, Transformer  # jak u Ciebie
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-# Globals expected by your code
 relevance_model = None
 cd_logreg_model = None
 cd_transformer_model = None
@@ -27,73 +25,51 @@ cd_transformer_model = None
 
 def init():
     """
-    Called once per worker.
+    init() jest OK dla batch.
+    W batch (tak jak w online) modele są montowane i ścieżka jest podawana w env.
+    U Ciebie było AZUREML_MODEL_DIR — zostawiam bez zmian.
     """
-    global relevance_model, cd_logreg_model, cd_transformer_model
+    global relevance_model
+    global cd_logreg_model
+    global cd_transformer_model
 
     logger.info("Initializing model...")
 
-    model_dir = os.getenv("AZUREML_MODEL_DIR")
-    if not model_dir:
+    model_root = os.getenv("AZUREML_MODEL_DIR")
+    if not model_root:
         raise RuntimeError("AZUREML_MODEL_DIR is not set")
 
-    # Your code expects an "AL" subfolder; keep the same behavior.
-    model_path = os.path.join(model_dir, "AL")
+    # U Ciebie było: join(model, "AL") — zostawiam
+    model_path = os.path.join(model_root, "AL")
 
-    logger.info(f"AZUREML_MODEL_DIR: {model_dir}")
-    try:
-        logger.info(f"Contents of AZUREML_MODEL_DIR: {os.listdir(model_dir)}")
-    except Exception:
-        pass
+    if not os.path.isdir(model_path):
+        # Minimalna walidacja, żeby błąd był czytelny w job logach
+        raise RuntimeError(
+            f"Model path not found: {model_path}. "
+            f"AZUREML_MODEL_DIR={model_root}, contents={os.listdir(model_root) if os.path.isdir(model_root) else 'N/A'}"
+        )
 
-    logger.info(f"Using model path: {model_path}")
-    try:
-        logger.info(f"Contents of model path: {os.listdir(model_path)}")
-    except Exception:
-        pass
+    logger.info("AZUREML_MODEL_DIR=%s", model_root)
+    logger.info("Using model path=%s", model_path)
 
-    # NOTE:
-    # I am keeping your original loading calls/paths to avoid changing model packaging assumptions.
-    # Replace these imports/classes with your real ones if needed.
-    from models import LogisticRegression, Transformer  # your project modules
+    relevance_model = LogisticRegression.load(
+        os.path.join(model_path, "logreg_relevance.joblib")
+    )
 
-    relevance_model = LogisticRegression.load(os.path.join(model_path, "logreg_relevance.joblib"))
-    cd_logreg_model = LogisticRegression.load(os.path.join(model_path, "logreg_cd.joblib"))
+    cd_logreg_model = LogisticRegression.load(
+        os.path.join(model_path, "logreg_cd.joblib")
+    )
 
     transformer = os.path.join(model_path, "transformer_model")
     model_cd_transformer_path = os.path.join(transformer, "transformer")
     model_cd_transformer_le_path = os.path.join(transformer, "transformer_le.joblib")
 
-    cd_transformer_model = Transformer.load(model_cd_transformer_path, model_cd_transformer_le_path)
+    cd_transformer_model = Transformer.load(
+        model_cd_transformer_path,
+        model_cd_transformer_le_path
+    )
 
     logger.info("Model initialized successfully.")
-
-
-def _parse_request(raw: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Accepts either JSON string or dict.
-    Returns validated dict with keys: document, num_preds.
-    """
-    if raw is None:
-        raise ValueError("Bad Request: Request body cannot be empty!")
-
-    if isinstance(raw, str):
-        if raw.strip() == "":
-            raise ValueError("Bad Request: Request body cannot be empty!")
-        try:
-            request_data = json.loads(raw)
-        except json.JSONDecodeError:
-            raise ValueError("Bad Request: Invalid JSON format!")
-    elif isinstance(raw, dict):
-        request_data = raw
-    else:
-        raise ValueError(f"Bad Request: Unsupported input type: {type(raw)}")
-
-    if "document" not in request_data or "num_preds" not in request_data:
-        raise ValueError("Bad Request: Invalid input, expected 'document' and 'num_preds'.")
-
-    request_data["num_preds"] = int(request_data["num_preds"])
-    return request_data
 
 
 def is_relevant_customer_demand(
@@ -101,20 +77,18 @@ def is_relevant_customer_demand(
     relevant_proba: float,
     cd_logreg_proba: float,
     cd_transformer_proba: float,
-) -> bool:
-    # Keeping your logic from screenshot
+):
     return (
         len(text.split(" ")) > 2
         and cd_logreg_proba > 0.1
-        and ((relevant_proba > 0.65 and cd_transformer_proba > 0.9) or cd_transformer_proba > 0.95)
+        and (
+            (relevant_proba > 0.65 and cd_transformer_proba > 0.9)
+            or cd_transformer_proba > 0.95
+        )
     )
 
 
-def inference(document: Dict[str, Any], num_cd_predictions: int) -> Dict[str, Any]:
-    import time
-    import pandas as pd
-    from pre_processing import clean_text  # your module
-
+def inference(document: json, num_cd_predictions: int):
     # load and process document
     start_time = time.time()
 
@@ -123,23 +97,31 @@ def inference(document: Dict[str, Any], num_cd_predictions: int) -> Dict[str, An
         for content in document["contentDomain"]["byId"].values()
     )
 
-    text = clean_text(text)
-    logger.info("Time to load and clean document: %s", time.time() - start_time)
+    text = pre_processing.clean_text(text)
+    latency = time.time() - start_time
+    print("Time to load and clean document: {}".format(latency))
 
     # score relevance model
     start_time = time.time()
     all_relevance_predictions = relevance_model.predict_proba(text)
-    logger.info("Time to score relevance model: %s", time.time() - start_time)
+    latency = time.time() - start_time
+    print("Time to score relevance model: {}".format(latency))
 
     # score cd logreg model
     start_time = time.time()
-    all_cd_logreg_predictions = cd_logreg_model.predict_top_n_labels_with_proba(text, num_cd_predictions)
-    logger.info("Time to score cd logreg model: %s", time.time() - start_time)
+    all_cd_logreg_predictions = cd_logreg_model.predict_top_n_labels_with_proba(
+        text, num_cd_predictions
+    )
+    latency = time.time() - start_time
+    print("Time to score cd logreg model: {}".format(latency))
 
     # score cd transformer
     start_time = time.time()
-    all_cd_transformer_predictions = cd_transformer_model.predict_top_n_labels_with_proba(text, num_cd_predictions)
-    logger.info("Time to score cd transformer model: %s", time.time() - start_time)
+    all_cd_transformer_predictions = cd_transformer_model.predict_top_n_labels_with_proba(
+        text, num_cd_predictions
+    )
+    latency = time.time() - start_time
+    print("Time to score cd transformer model: {}".format(latency))
 
     # format results
     start_time = time.time()
@@ -174,44 +156,64 @@ def inference(document: Dict[str, Any], num_cd_predictions: int) -> Dict[str, An
 
     document["documentDemandPredictions"] = list(document_demand_predictions)
 
-    logger.info("Time to format results: %s", time.time() - start_time)
-    return document
+    result = document
+
+    latency = time.time() - start_time
+    print("Time to format results: {}".format(latency))
+
+    return result
 
 
-def run(mini_batch: List[str]) -> List[Dict[str, Any]]:
+def run(mini_batch):
     """
-    Batch entrypoint.
-    mini_batch: list of file paths (strings) provided by Azure ML.
-    Each file should contain JSON text with keys: document, num_preds.
+    Batch Endpoint contract:
+    - mini_batch: lista ścieżek do plików wejściowych
+    - każdy plik zawiera JSON w tym samym formacie co online:
+        {"document": {...}, "num_preds": 5}
 
-    Returns a list of dict outputs (one per input).
+    Zwraca listę wyników (po 1 na plik).
+    Dodana obsługa błędów per plik (nie wywala całego joba na 1 złym pliku).
     """
-    outputs: List[Dict[str, Any]] = []
+    outputs = []
 
     for item in mini_batch:
         try:
-            # Allow local/unit tests to pass raw JSON directly instead of a file path
-            if isinstance(item, str) and os.path.exists(item):
-                with open(item, "r", encoding="utf-8") as f:
-                    raw_data = f.read()
-            else:
-                raw_data = item  # raw JSON string
+            # item powinien być ścieżką do pliku
+            if not isinstance(item, str) or not os.path.exists(item):
+                raise ValueError(f"Input is not a valid file path: {item}")
 
-            logger.info("Received item: %s", item if isinstance(item, str) else type(item))
+            with open(item, "r", encoding="utf-8") as f:
+                raw_data = f.read()
 
-            request_data = _parse_request(raw_data)
+            logger.info(f"Received request with data (file={item})")
+
+            if not raw_data or raw_data.strip() == "":
+                raise ValueError("Bad Request: Request body cannot be empty!")
+
+            try:
+                request_data = json.loads(raw_data)
+            except json.JSONDecodeError:
+                raise ValueError("Bad Request: Invalid JSON format!")
+
+            if "document" not in request_data or "num_preds" not in request_data:
+                raise ValueError("Bad Request: Invalid input, expected 'document' and 'num_preds'.")
+
             document = request_data["document"]
-            num_pred = request_data["num_preds"]
+            num_pred = int(request_data["num_preds"])
 
             response = inference(document, num_pred)
 
-            # Keep a consistent wrapper like your online response did
+            # Tak jak online: wrapper z predictions
             outputs.append({"predictions": response})
 
         except Exception as e:
-            logger.error("Error processing item: %s", str(e))
-            logger.error(traceback.format_exc())
-            # For batch you usually DON'T want to crash whole job because one file is bad.
-            outputs.append({"error": str(e)})
+            # Obsługa błędu per plik: zapisujesz error zamiast wywalać cały job
+            logger.error(f"Error processing item {item}: {str(e)}", exc_info=True)
+            outputs.append(
+                {
+                    "error": str(e),
+                    "input": item,
+                }
+            )
 
     return outputs
