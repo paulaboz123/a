@@ -1,31 +1,39 @@
 parameters:
   - name: environment
     type: string
-    values: [dev, test, prod]
-
   - name: serviceConnection
+    type: string
+  - name: appServiceConnection
     type: string
   - name: resourceGroup
     type: string
   - name: amlWorkspace
     type: string
-
-  # Keep BU like in your original code
+  - name: keyVaultName
+    type: string
   - name: bu
     type: string
+  - name: functionAppName
+    type: string
+  - name: appResourceGroup
+    type: string
 
-  # Batch compute cluster (AmlCompute)
+  # Batch compute (AmlCompute cluster name)
   - name: batchCompute
     type: string
 
-  # Submit job (required to actually process data)
+  # Submit job (Batch does nothing until a job is submitted)
   - name: jobDeploymentName
     type: string
-    default: en-model
   - name: jobInput
     type: string
   - name: jobOutput
     type: string
+
+  # Keep the step "1:1" with your existing template; set to 'true' only if you still need it.
+  - name: restartFunctionApp
+    type: boolean
+    default: false
 
 steps:
   - checkout: self
@@ -36,7 +44,6 @@ steps:
       targetType: inline
       script: |
         set -euo pipefail
-
         az extension add -n ml -y || az extension update -n ml
         pip install --upgrade pip
         pip install "paramiko>=2.11.0" "cryptography>=3.4.8"
@@ -48,8 +55,8 @@ steps:
         fi
 
   - task: AzureCLI@2
-    name: deploy_batch_endpoint
-    displayName: Deploy Batch Endpoint (create/update)
+    name: deploy_managed_endpoint
+    displayName: Deploy Managed Endpoint (BATCH)
     inputs:
       azureSubscription: ${{ parameters.serviceConnection }}
       scriptType: bash
@@ -60,29 +67,21 @@ steps:
 
         az configure --defaults workspace=${{ parameters.amlWorkspace }} group=${{ parameters.resourceGroup }}
 
-        WORKDIR="src/deployment/batch_endpoint/${{ parameters.environment }}"
-        RENDERDIR="$WORKDIR/_rendered"
-        mkdir -p "$RENDERDIR"
-
-        BU_LOWER="$(echo "${{ parameters.bu }}" | tr '[:upper:]' '[:lower:]')"
-        ENDPOINT_FILE="$RENDERDIR/endpoint-${BU_LOWER}.yml"
-
-        # Render endpoint template -> endpoint-${bu}.yml
-        ENDPOINT_NAME="${BU_LOWER}-batch-${{ parameters.environment }}"
-        sed           -e "s/__ENDPOINT_NAME__/${ENDPOINT_NAME}/g"           "$WORKDIR/templates/endpoint.template.yml" > "$ENDPOINT_FILE"
-
-        echo "Rendered ENDPOINT_FILE=$ENDPOINT_FILE"
-        echo "Rendered ENDPOINT_NAME=$ENDPOINT_NAME"
+        ENDPOINT_FILE="endpoint-${{ lower(parameters.bu) }}.yml"
+        ENDPOINT_NAME="$(yq -r '.name' "$ENDPOINT_FILE")"
 
         if az ml batch-endpoint show -n "$ENDPOINT_NAME" >/dev/null 2>&1; then
+          echo "Update batch endpoint: $ENDPOINT_NAME"
           az ml batch-endpoint update -f "$ENDPOINT_FILE"
         else
+          echo "Create batch endpoint: $ENDPOINT_NAME"
           az ml batch-endpoint create -f "$ENDPOINT_FILE"
         fi
+    workingDirectory: src/deployment/batch_endpoint/${{ parameters.environment }}/
 
   - task: AzureCLI@2
-    name: deploy_batch_deployments
-    displayName: Deploy 3 Batch Deployments (create/update)
+    name: deploy_model_managed_endpoint
+    displayName: Deploy Models To Managed Endpoint (BATCH) - 3 deployments
     inputs:
       azureSubscription: ${{ parameters.serviceConnection }}
       scriptType: bash
@@ -92,68 +91,63 @@ steps:
         set -euo pipefail
 
         az configure --defaults workspace=${{ parameters.amlWorkspace }} group=${{ parameters.resourceGroup }}
-
-        WORKDIR="src/deployment/batch_endpoint/${{ parameters.environment }}"
-        RENDERDIR="$WORKDIR/_rendered"
-        mkdir -p "$RENDERDIR"
-
-        BU_LOWER="$(echo "${{ parameters.bu }}" | tr '[:upper:]' '[:lower:]')"
-        ENDPOINT_NAME="${BU_LOWER}-batch-${{ parameters.environment }}"
-
-        render_deployment () {
-          local lang="$1"
-          local model_name="$2"
-          local deploy_name="${lang}-model"
-          local src="$WORKDIR/templates/deployment-${lang}.template.yml"
-          local out="$RENDERDIR/deployment-${BU_LOWER}-${lang}.yml"
-
-          sed             -e "s/__DEPLOYMENT_NAME__/${deploy_name}/g"             -e "s/__ENDPOINT_NAME__/${ENDPOINT_NAME}/g"             -e "s#__CODE_DIR__#${WORKDIR}/scoring#g"             -e "s/__MODEL_ASSET__/${model_name}/g"             "$src" > "$out"
-
-          echo "$out"
-        }
-
-        # Model asset strings can be overridden by editing templates
-        DEPLOY_DE_FILE="$(render_deployment de "azureml:de@latest")"
-        DEPLOY_PL_FILE="$(render_deployment pl "azureml:pl@latest")"
-        DEPLOY_EN_FILE="$(render_deployment en "azureml:en@latest")"
 
         deploy_one () {
           local file="$1"
-          local dname
-          local ename
-          dname="$(yq -r '.name' "$file")"
-          ename="$(yq -r '.endpoint_name' "$file")"
+          local endpoint
+          local name
+          endpoint="$(yq -r '.endpoint_name' "$file")"
+          name="$(yq -r '.name' "$file")"
 
-          if az ml batch-deployment show -e "$ename" -n "$dname" >/dev/null 2>&1; then
+          if az ml batch-deployment show -e "$endpoint" -n "$name" >/dev/null 2>&1; then
+            echo "Update batch deployment: $name"
             az ml batch-deployment update -f "$file" --set compute="azureml:${{ parameters.batchCompute }}"
           else
+            echo "Create batch deployment: $name"
             az ml batch-deployment create -f "$file" --set compute="azureml:${{ parameters.batchCompute }}"
           fi
         }
 
-        deploy_one "$DEPLOY_DE_FILE"
-        deploy_one "$DEPLOY_PL_FILE"
-        deploy_one "$DEPLOY_EN_FILE"
+        BU="${{ lower(parameters.bu) }}"
+        deploy_one "deployment-${BU}-de.yml"
+        deploy_one "deployment-${BU}-pl.yml"
+        deploy_one "deployment-${BU}-en.yml"
+    workingDirectory: src/deployment/batch_endpoint/${{ parameters.environment }}/
 
   - task: AzureCLI@2
     name: submit_batch_job
-    displayName: Submit Batch Job (so analysis runs)
+    displayName: Submit Batch Job (invoke)
     inputs:
       azureSubscription: ${{ parameters.serviceConnection }}
       scriptType: bash
       scriptLocation: inlineScript
-      failOnStandardError: false
+      failOnStandardError: true
       inlineScript: |
         set -euo pipefail
 
         az configure --defaults workspace=${{ parameters.amlWorkspace }} group=${{ parameters.resourceGroup }}
 
-        BU_LOWER="$(echo "${{ parameters.bu }}" | tr '[:upper:]' '[:lower:]')"
-        ENDPOINT_NAME="${BU_LOWER}-batch-${{ parameters.environment }}"
+        ENDPOINT_FILE="endpoint-${{ lower(parameters.bu) }}.yml"
+        ENDPOINT_NAME="$(yq -r '.name' "$ENDPOINT_FILE")"
 
-        if [ -z "${{ parameters.jobInput }}" ] || [ -z "${{ parameters.jobOutput }}" ]; then
-          echo "jobInput and jobOutput are required."
+        if [ -z "${{ parameters.jobInput }}" ] || [ -z "${{ parameters.jobOutput }}" ] || [ -z "${{ parameters.jobDeploymentName }}" ]; then
+          echo "jobInput/jobOutput/jobDeploymentName must be set to submit a Batch job."
           exit 1
         fi
 
+        echo "Submitting job: endpoint=$ENDPOINT_NAME deployment=${{ parameters.jobDeploymentName }}"
         az ml batch-endpoint invoke           -n "$ENDPOINT_NAME"           --deployment-name "${{ parameters.jobDeploymentName }}"           --input "${{ parameters.jobInput }}"           --output "${{ parameters.jobOutput }}"
+    workingDirectory: src/deployment/batch_endpoint/${{ parameters.environment }}/
+
+  - task: AzureCLI@2
+    name: restart_function_app
+    displayName: Restart function app (optional)
+    condition: and(succeeded(), eq('${{ parameters.restartFunctionApp }}', 'true'))
+    inputs:
+      azureSubscription: ${{ parameters.appServiceConnection }}
+      scriptType: bash
+      scriptLocation: inlineScript
+      failOnStandardError: true
+      inlineScript: |
+        set -euo pipefail
+        az functionapp restart --name "${{ parameters.functionAppName }}" --resource-group "${{ parameters.appResourceGroup }}"
