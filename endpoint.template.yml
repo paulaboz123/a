@@ -1,3 +1,7 @@
 $schema: https://azuremlschemas.azureedge.net/latest/batchEndpoint.schema.json
-name: __ENDPOINT_NAME__
-auth_mode: key
+name: albot-endpoint-dev
+auth_mode: aad_token   # albo: key
+
+# Batch nie ma traffic split. Jeśli chcesz “domyślny”:
+defaults:
+  deployment_name: en-model
